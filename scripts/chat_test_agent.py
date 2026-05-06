@@ -236,6 +236,64 @@ def _maybe_save_session(agent: CodeAgent, path: str, flag: dict, reason: str) ->
     except Exception as exc:
         console.print(f"[bold red]✗ Auto-save failed:[/bold red] {exc}")
 
+def _default_checkpoint_path() -> str:
+    return os.path.join(PROJECT_ROOT, "memory", "checkpoints", "checkpoint-latest.json")
+
+def _check_and_offer_checkpoint_resume(agent: CodeAgent, session: 'PromptSession') -> bool:
+    """Check for a resumable checkpoint and offer to resume it.
+
+    Returns True if the user chose to resume (and resume was attempted),
+    False otherwise.
+    """
+    checkpoint = agent.load_checkpoint()
+    if not checkpoint:
+        return False
+
+    pending_input = checkpoint.get("checkpoint_pending_input", "")
+    step = checkpoint.get("checkpoint_current_step", 0)
+    timestamp = checkpoint.get("checkpoint_timestamp", 0)
+    history_count = len(checkpoint.get("history_messages", []))
+
+    # Format timestamp
+    import datetime
+    time_str = datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "unknown"
+
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]检测到未完成的 ReAct 任务[/bold yellow]\n\n"
+        f"[dim]中断步骤:[/dim] step {step}\n"
+        f"[dim]历史消息数:[/dim] {history_count}\n"
+        f"[dim]保存时间:[/dim] {time_str}\n"
+        f"[dim]原始输入:[/dim] {pending_input[:200]}{'...' if len(pending_input) > 200 else ''}",
+        title="[checkpoint]Checkpoint Detected[/checkpoint]",
+        border_style="yellow",
+    ))
+
+    try:
+        choice = session.prompt(
+            HTML('<question>是否恢复上次中断的任务? (y/n): </question>'),
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+    if choice not in ("y", "yes"):
+        console.print("[dim]跳过 checkpoint，开始新会话。[/dim]")
+        agent._clear_checkpoint()
+        return False
+
+    console.print("[bold cyan]🔄 正在恢复 checkpoint...[/bold cyan]")
+    try:
+        response = agent.resume_from_checkpoint(checkpoint)
+        console.print()
+        _print_assistant_response(response)
+        console.print("[bold green]✓ Checkpoint 恢复完成[/bold green]")
+        console.print()
+        return True
+    except Exception as exc:
+        console.print(f"[bold red]✗ Checkpoint 恢复失败:[/bold red] {exc}")
+        agent._clear_checkpoint()
+        return False
+
 def _print_assistant_response(text: str) -> None:
     md = Markdown(text)
     console.print(Panel(md, title="[agent]Assistant[/agent]", border_style="blue", expand=False))
@@ -313,12 +371,15 @@ def main() -> None:
     # Setup history for prompt_toolkit
     history_file = os.path.join(PROJECT_ROOT, ".chat_history")
     session = PromptSession(history=FileHistory(history_file))
-    
+
     prompt_style = PromptStyle.from_dict({
         'user': '#00ff00 bold',
         'arrow': '#0000ff',
         'host': '#00ffff',
     })
+
+    # 检查是否有可恢复的 checkpoint（需要在 PromptSession 创建之后）
+    _check_and_offer_checkpoint_resume(agent, session)
 
     try:
         while True:
@@ -366,6 +427,13 @@ def main() -> None:
                         console.print(f"[bold green]✓ Session loaded:[/bold green] {path}")
                     except Exception as exc:
                         console.print(f"[bold red]✗ Load failed:[/bold red] {exc}")
+                    continue
+                elif user_input.lower() == "/resume":
+                    checkpoint = agent.load_checkpoint()
+                    if not checkpoint:
+                        console.print("[bold yellow]没有找到可恢复的 checkpoint。[/bold yellow]")
+                        continue
+                    _check_and_offer_checkpoint_resume(agent, session)
                     continue
                 elif user_input.lower().startswith("/team msg "):
                     if not agent.enable_agent_teams or agent.team_manager is None:
@@ -462,6 +530,7 @@ def main() -> None:
                         "/model, /info - Show model and usage info\n"
                         "/save [path] - Save session snapshot\n"
                         "/load [path] - Load session snapshot\n"
+                        "/resume - Resume from last checkpoint (断点续传)\n"
                         f"{TEAM_MSG_USAGE}\n"
                         f"{TEAM_WATCH_USAGE}\n"
                         f"{DELEGATE_USAGE}\n"

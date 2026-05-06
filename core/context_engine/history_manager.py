@@ -23,6 +23,7 @@ from datetime import datetime
 from ..message import Message
 from ..config import Config
 from .observation_truncator import truncate_observation
+from .token_estimator import TokenEstimator
 
 
 class HistoryManager:
@@ -40,21 +41,25 @@ class HistoryManager:
         self,
         config: Optional[Config] = None,
         summary_generator: Optional[Callable[[List[Message]], Optional[str]]] = None,
+        token_estimator: Optional[TokenEstimator] = None,
     ):
         """
         初始化历史管理器
-        
+
         Args:
             config: 配置对象，包含 context_window、compression_threshold 等
             summary_generator: Summary 生成回调函数，接收待压缩的消息列表，返回 Summary 文本
                               如果为 None，则压缩时不生成 Summary，仅做截断
+            token_estimator: Token 估算器，用于精确计算 token 数
+                            如果为 None，则自动创建一个默认实例
         """
         self._config = config or Config.from_env()
         self._summary_generator = summary_generator
-        
+        self._token_estimator = token_estimator or TokenEstimator()
+
         # 历史消息列表
         self._messages: List[Message] = []
-        
+
         # 上一次 API 调用的 token 使用量（精确值）
         self._last_usage_tokens: int = 0
         # 会话累计 token 使用量
@@ -222,30 +227,78 @@ class HistoryManager:
         """获取会话累计 token 使用量"""
         return self._total_usage_tokens
 
+    def update_model(self, model: str, provider: Optional[str] = None) -> None:
+        """
+        更新 tokenizer 的模型（支持会话中途切换模型）
+
+        Args:
+            model: 新的模型名称
+            provider: 新的供应商名称（可选）
+        """
+        self._token_estimator.set_model(model)
+        if provider:
+            self._token_estimator.set_provider(provider)
+
     def estimate_total_tokens(self, pending_input: str) -> int:
         """估算会话累计 token（累计 usage + 当前输入估算）"""
-        input_estimate = len(pending_input) // 3
+        input_estimate = self._token_estimator.estimate_text(pending_input or "")
         return self._total_usage_tokens + input_estimate
 
     def estimate_context_tokens(self, pending_input: str) -> int:
         """估算当前上下文 token（历史消息 + 当前输入）"""
-        total_chars = len(pending_input or "")
+        messages = self._build_estimate_messages(pending_input)
+        return self._token_estimator.estimate_messages(messages)
+
+    def _build_estimate_messages(self, pending_input: str) -> List[Dict[str, Any]]:
+        """
+        构建用于 token 估算的消息列表
+
+        将内部 Message 格式转换为 OpenAI messages 格式，
+        供 TokenEstimator.estimate_messages() 使用。
+
+        Args:
+            pending_input: 待发送的用户输入
+
+        Returns:
+            OpenAI 格式的消息列表
+        """
+        messages: List[Dict[str, Any]] = []
+
         for msg in self._messages:
-            content = msg.content or ""
-            total_chars += len(str(content))
+            m: Dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
             meta = msg.metadata or {}
+
             if msg.role == "assistant":
+                # 构建 tool_calls 结构
                 tool_calls = meta.get("tool_calls")
                 if tool_calls:
-                    try:
-                        total_chars += len(json.dumps(tool_calls, ensure_ascii=False))
-                    except Exception:
-                        total_chars += len(str(tool_calls))
+                    m["tool_calls"] = []
+                    for tc in tool_calls:
+                        name = tc.get("name", "")
+                        arguments = tc.get("arguments", {})
+                        args_str = (
+                            json.dumps(arguments, ensure_ascii=False)
+                            if isinstance(arguments, dict)
+                            else str(arguments)
+                        )
+                        m["tool_calls"].append({
+                            "function": {
+                                "name": name,
+                                "arguments": args_str,
+                            }
+                        })
             elif msg.role == "tool":
-                tool_name = meta.get("tool_name")
-                if tool_name:
-                    total_chars += len(str(tool_name))
-        return total_chars // 3
+                # 将 tool_name 合并到 content 中以便估算
+                tool_name = meta.get("tool_name", "unknown")
+                m["content"] = f"{tool_name}: {msg.content or ''}"
+
+            messages.append(m)
+
+        # 添加待发送的用户输入
+        if pending_input:
+            messages.append({"role": "user", "content": pending_input})
+
+        return messages
     
     # =========================================================================
     # 压缩触发检测
@@ -254,28 +307,34 @@ class HistoryManager:
     def should_compress(self, pending_input: str) -> bool:
         """
         检测是否应该触发压缩
-        
+
         根据 A6 规则：
-        - estimated_total = last_usage + len(user_input) // 3
+        - estimated_total = max(estimate_context_tokens, last_usage + estimate_input)
         - 触发条件：estimated_total >= threshold 且消息数 >= 3
-        
+
         Args:
             pending_input: 待发送的用户输入
-        
+
         Returns:
             是否需要压缩
         """
         # 最低消息数要求
         if len(self._messages) < 3:
             return False
-        
-        # 计算预估 token 数（兼容 usage 与上下文字符估算两条路径）
-        usage_estimated_total = self._last_usage_tokens + len(pending_input or "") // 3
-        estimated_total = max(self.estimate_context_tokens(pending_input), usage_estimated_total)
-        
+
+        # 计算预估 token 数（兼容 usage 与上下文估算两条路径）
+        usage_estimated_total = (
+            self._last_usage_tokens
+            + self._token_estimator.estimate_text(pending_input or "")
+        )
+        estimated_total = max(
+            self.estimate_context_tokens(pending_input),
+            usage_estimated_total,
+        )
+
         # 计算阈值
         threshold = int(self._config.context_window * self._config.compression_threshold)
-        
+
         return estimated_total >= threshold
     
     # =========================================================================
@@ -533,24 +592,33 @@ class HistoryManager:
                 messages.append(assistant_msg)
             elif msg.role == "tool":
                 tool_name = (msg.metadata or {}).get("tool_name", "unknown")
+                # Extract text content from tool result (following Tool Response Protocol)
+                tool_content = msg.content
+                try:
+                    parsed = json.loads(msg.content)
+                    if isinstance(parsed, dict) and "text" in parsed:
+                        tool_content = parsed["text"]
+                except json.JSONDecodeError:
+                    pass  # Use original content if not valid JSON
+                
                 if strict_mode:
                     tool_call_id = (msg.metadata or {}).get("tool_call_id")
                     if tool_call_id:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
-                            "content": msg.content,
+                            "content": tool_content,
                         })
                     else:
                         logger.warning("Strict tool mode active but missing tool_call_id; falling back to compat")
                         messages.append({
                             "role": "user",
-                            "content": f"Observation ({tool_name}): {msg.content}",
+                            "content": f"Observation ({tool_name}): {tool_content}",
                         })
                 else:
                     messages.append({
                         "role": "user",
-                        "content": f"Observation ({tool_name}): {msg.content}",
+                        "content": f"Observation ({tool_name}): {tool_content}",
                     })
             elif msg.role == "summary":
                 # Summary 作为 system 消息注入

@@ -220,6 +220,7 @@ class ObservationTruncator:
         # 清理过期文件（低频执行）
         self._maybe_cleanup()
         
+        # 输出json格式
         return json.dumps(truncated_result, ensure_ascii=False, separators=(",", ":"))
     
     def _truncate_content(

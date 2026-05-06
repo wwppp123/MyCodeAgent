@@ -1,9 +1,14 @@
-"""Session persistence utilities (scheme B: snapshot includes system messages)."""
+"""Session persistence utilities (scheme B: snapshot includes system messages).
+
+Checkpoint support: enables saving ReAct loop progress mid-execution so that
+interrupted sessions can be resumed from the last completed step.
+"""
 
 from __future__ import annotations
 
 import json
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -78,3 +83,67 @@ def load_session_snapshot(path: str | Path) -> Dict[str, Any]:
     payload.setdefault("team_store_dir", ".teams")
     payload.setdefault("task_store_dir", ".tasks")
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint support: save/load ReAct loop progress for resume
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(path: str | Path, snapshot: Dict[str, Any], pending_input: str, current_step: int) -> None:
+    """Save a checkpoint with ReAct loop state.
+
+    The snapshot should be a full session snapshot (from build_session_snapshot).
+    This function adds checkpoint metadata and writes to *path*.
+    """
+    checkpoint = dict(snapshot)
+    checkpoint["checkpoint_pending_input"] = pending_input
+    checkpoint["checkpoint_current_step"] = current_step
+    checkpoint["checkpoint_status"] = "running"
+    checkpoint["checkpoint_timestamp"] = time.time()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def mark_checkpoint_completed(path: str | Path) -> None:
+    """Mark an existing checkpoint as completed (no longer resumable)."""
+    path = Path(path)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["checkpoint_status"] = "completed"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_checkpoint(path: str | Path) -> None:
+    """Remove a checkpoint file if it exists."""
+    path = Path(path)
+    if path.exists():
+        path.unlink(missing_ok=True)
+
+
+def load_checkpoint(path: str | Path) -> Optional[Dict[str, Any]]:
+    """Load a checkpoint and return it if it is resumable.
+
+    Returns None if the file doesn't exist, is invalid, or is already completed.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("checkpoint_status") != "running":
+        return None
+    if not data.get("checkpoint_pending_input"):
+        return None
+    if not isinstance(data.get("checkpoint_current_step"), int):
+        return None
+    # Must have history to be useful
+    if not data.get("history_messages"):
+        return None
+    return data

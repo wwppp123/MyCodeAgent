@@ -4,7 +4,8 @@ import os
 import logging
 import sys
 import traceback as tb
-from typing import Any, Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Optional, List, Tuple, Dict
 
 from core.agent import Agent
 from core.llm import HelloAgentsLLM
@@ -18,8 +19,13 @@ load_env()
 from core.context_engine.history_manager import HistoryManager
 from core.context_engine.input_preprocessor import preprocess_input
 from core.context_engine.summary_compressor import create_summary_generator
-from core.session_store import build_session_snapshot, save_session_snapshot, load_session_snapshot
+from core.context_engine.token_estimator import TokenEstimator
+from core.session_store import (
+    build_session_snapshot, save_session_snapshot, load_session_snapshot,
+    save_checkpoint, load_checkpoint, mark_checkpoint_completed, clear_checkpoint,
+)
 from core.team_engine.display_mode import resolve_teammate_mode
+from core.memory_store import MemoryStore
 from tools.registry import ToolRegistry
 from tools.builtin.list_files import ListFilesTool
 from tools.builtin.search_files_by_name import SearchFilesByNameTool
@@ -33,6 +39,8 @@ from tools.builtin.skill import SkillTool
 from tools.builtin.bash import BashTool
 from tools.builtin.ask_user import AskUserTool
 from tools.builtin.task import TaskTool
+from tools.builtin.memory import MemoryTool
+from tools.builtin.weather import WeatherTool
 from tools.mcp.loader import register_mcp_servers, format_mcp_tools_prompt
 from utils import setup_logger
 from core.skills.skill_loader import SkillLoader
@@ -127,11 +135,18 @@ class CodeAgent(Agent):
             config=self.config,
             verbose=self.verbose,
         )
-        
+
+        # Token 估算器（使用 LLM 的模型和供应商信息）
+        token_estimator = TokenEstimator(
+            model=getattr(self.llm, "model", None),
+            provider=getattr(self.llm, "provider", None),
+        )
+
         # 历史管理器（替代 Agent._history）
         self.history_manager = HistoryManager(
             config=self.config,
             summary_generator=summary_generator,
+            token_estimator=token_estimator,
         )
         
         # Skills
@@ -139,10 +154,14 @@ class CodeAgent(Agent):
         self._skills_prompt = ""
         self._refresh_skills_prompt()
 
+        # Memory Store (持久化记忆)
+        memory_store_path = str(getattr(self.config, "memory_store_path", ".agent_memory/memory.json") or ".agent_memory/memory.json")
+        self.memory_store = MemoryStore(store_path=memory_store_path, logger=self.logger)
+
         # 注册工具
         self._register_builtin_tools()
-        self._mcp_clients = []
-        self._mcp_tools_prompt = ""
+        self._mcp_clients = [] # mcp服务客户端实例
+        self._mcp_tools_prompt = "" # mcp工具提示词，包括name, description, parameters, returns
         self._register_mcp_tools()
         
         # 上下文构建器
@@ -152,6 +171,7 @@ class CodeAgent(Agent):
             system_prompt_override=self.system_prompt,
             mcp_tools_prompt=self._mcp_tools_prompt,
             skills_prompt=self._skills_prompt,
+            memory_store=self.memory_store,
         )
 
         # Trace 日志（单实例贯穿 Agent 生命周期）
@@ -159,6 +179,10 @@ class CodeAgent(Agent):
         self._system_messages_logged = False
         self._run_id = 0
         self._system_messages_override: Optional[List[dict]] = None
+
+        # Checkpoint 目录（用于断点续传）
+        self._checkpoint_dir = os.path.join(self.project_root, "memory", "checkpoints")
+        os.makedirs(self._checkpoint_dir, exist_ok=True)
     
     def _register_builtin_tools(self):
         """注册内置工具"""
@@ -188,6 +212,12 @@ class CodeAgent(Agent):
                 team_manager=self.team_manager,
             )
         )
+        # Memory tool for persistent memory management
+        self.tool_registry.register_tool(
+            MemoryTool(project_root=self.project_root, memory_store=self.memory_store)
+        )
+        # Weather tool for querying weather information
+        self.tool_registry.register_tool(WeatherTool(project_root=self.project_root))
         if self.enable_agent_teams:
             self._register_agent_teams_tools()
 
@@ -274,8 +304,14 @@ class CodeAgent(Agent):
         if not show_raw:
             self.last_response_raw = None
 
+        # 新的 run 开始，清除旧 checkpoint（避免残留的 running 状态干扰）
+        self._clear_checkpoint()
+
         if self.console_progress:
             self._console("⏳ Agent 正在处理，请稍候...")
+
+        # 动态注入当前时间
+        # 在context_builder.py中
 
         # 1. 预处理用户输入（@file 解析）
         self._refresh_skills_prompt()
@@ -363,20 +399,22 @@ class CodeAgent(Agent):
         pending_input: str,
         show_raw: bool,
         trace_logger,
+        resume_from_step: int = 1,
     ) -> str:
         """
         ReAct 循环（Message List 模式）
-        
+
         每步：
         1. 构建 messages = system(L1/L2) + history(user/assistant/tool)
         2. 调用 LLM
         3. 解析 Thought/Action
         4. 若为 Finish：返回结果
         5. 若为工具调用：执行工具，将 assistant + tool 消息追加到 history
+        6. 自动保存 checkpoint（支持断点续传）
         """
         tool_choice = "auto"
 
-        for step in range(1, self.max_steps + 1):
+        for step in range(resume_from_step, self.max_steps + 1):
             tools_schema = self._get_openai_tools_for_current_mode()
             if self.enable_agent_teams and self.team_manager and hasattr(self.context_builder, "set_runtime_system_blocks"):
                 events = self.team_manager.drain_events()
@@ -539,7 +577,7 @@ class CodeAgent(Agent):
 
             if not tool_calls and (not response_text or not str(response_text).strip()):
                 break
-            # 有工具调用：写入 assistant + 执行 tools
+            # 有工具调用：写入 assistant + 并行执行 tools
             if tool_calls:
                 # ensure each tool_call has an id (OpenAI strict requirement)
                 for call in tool_calls:
@@ -553,7 +591,7 @@ class CodeAgent(Agent):
                         "action_type": "tool_call",
                         "tool_calls": tool_calls,
                     },
-                    reasoning_content=reasoning_content,  # ⚠️ 传递 reasoning_content
+                    reasoning_content=reasoning_content,
                 )
                 self._log_message_write(
                     trace_logger,
@@ -563,24 +601,69 @@ class CodeAgent(Agent):
                     step,
                 )
 
-                for call in tool_calls:
-                    tool_name = call.get("name") or "unknown_tool"
-                    tool_call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
-                    raw_args = call.get("arguments") or {}
-                    tool_input, parse_err = self._ensure_json_input(raw_args)
-                    if parse_err:
-                        error_result = {
-                            "status": "error",
-                            "error": {"code": "INVALID_PARAM", "message": f"Tool arguments parse error: {parse_err}"},
-                            "data": {},
+                # ---- 并行工具执行 ----
+                # 多个工具调用时使用线程池并行执行，单个时直接调用避免开销
+                if len(tool_calls) > 1:
+                    trace_logger.log_event(
+                        "parallel_tool_start",
+                        {"count": len(tool_calls), "tools": [c.get("name") for c in tool_calls]},
+                        step=step,
+                    )
+                    if self.console_verbose:
+                        tool_names = [c.get("name", "?") for c in tool_calls]
+                        self._console(f"\n⚡ 并行执行 {len(tool_calls)} 个工具: {', '.join(tool_names)}\n")
+
+                    results: list[dict] = [None] * len(tool_calls)  # type: ignore[list-item]
+                    with ThreadPoolExecutor(max_workers=min(len(tool_calls), 8)) as pool:
+                        future_to_idx = {
+                            pool.submit(self._execute_tool_call, call): idx
+                            for idx, call in enumerate(tool_calls)
                         }
-                        observation = json.dumps(error_result, ensure_ascii=False)
+                        for future in as_completed(future_to_idx):
+                            idx = future_to_idx[future]
+                            try:
+                                results[idx] = future.result()
+                            except Exception as exc:
+                                call = tool_calls[idx]
+                                results[idx] = {
+                                    "tool_name": call.get("name") or "unknown_tool",
+                                    "tool_call_id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                                    "tool_input": call.get("arguments") or {},
+                                    "observation": json.dumps({
+                                        "status": "error",
+                                        "error": {"code": "EXECUTION_ERROR", "message": str(exc)},
+                                        "data": {},
+                                    }, ensure_ascii=False),
+                                    "error": True,
+                                    "error_stage": "tool_execution",
+                                    "error_message": str(exc),
+                                    "traceback": tb.format_exc(),
+                                }
+
+                    trace_logger.log_event(
+                        "parallel_tool_end",
+                        {"count": len(results), "tools": [r["tool_name"] for r in results]},
+                        step=step,
+                    )
+                else:
+                    # 单个工具调用，直接执行避免线程池开销
+                    results = [self._execute_tool_call(tool_calls[0])]
+
+                # ---- 将所有工具结果写入 history ----
+                for result in results:
+                    tool_name = result["tool_name"]
+                    tool_call_id = result["tool_call_id"]
+                    observation = result["observation"]
+                    tool_input = result["tool_input"]
+
+                    # trace 日志
+                    if result.get("error"):
                         trace_logger.log_event(
                             "error",
                             {
-                                "stage": "tool_call_parse",
-                                "error_code": "INVALID_PARAM",
-                                "message": str(parse_err),
+                                "stage": result.get("error_stage", "tool_execution"),
+                                "error_code": "EXECUTION_ERROR",
+                                "message": result.get("error_message", ""),
                                 "tool": tool_name,
                                 "tool_call_id": tool_call_id,
                             },
@@ -588,21 +671,20 @@ class CodeAgent(Agent):
                         )
                     else:
                         trace_logger.log_event("tool_call", {"tool": tool_name, "args": tool_input, "tool_call_id": tool_call_id}, step=step)
-                        if self.console_verbose:
-                            self._console(f"\n🎬 Action: {tool_name}[{tool_input}]\n")
-                        elif self.logger.isEnabledFor(logging.DEBUG):
-                            self.logger.debug("Action: %s %s", tool_name, tool_input)
                         try:
-                            observation = self._execute_tool(tool_name, tool_input)
-                            try:
-                                result_obj = json.loads(observation)
-                                trace_logger.log_event("tool_result", {"tool": tool_name, "result": result_obj}, step=step)
-                            except json.JSONDecodeError:
-                                trace_logger.log_event("tool_result", {"tool": tool_name, "result": {"text": observation}}, step=step)
-                        except Exception as e:
-                            error_result = {"status": "error", "error": {"code": "EXECUTION_ERROR", "message": str(e)}, "data": {}}
-                            observation = json.dumps(error_result, ensure_ascii=False)
-                            trace_logger.log_event("error", {"stage": "tool_execution", "error_code": "EXECUTION_ERROR", "message": str(e), "tool": tool_name, "traceback": tb.format_exc()}, step=step)
+                            result_obj = json.loads(observation)
+                            trace_logger.log_event("tool_result", {"tool": tool_name, "result": result_obj}, step=step)
+                        except json.JSONDecodeError:
+                            trace_logger.log_event("tool_result", {"tool": tool_name, "result": {"text": observation}}, step=step)
+
+                    if self.console_verbose:
+                        self._console(f"\n🎬 Action: {tool_name}[{tool_input}]\n")
+                        display_obs = observation[:300] + "..." if len(observation) > 300 else observation
+                        self._console(f"\n👀 Observation: {display_obs}\n")
+                    elif self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("Action: %s %s", tool_name, tool_input)
+                        display_obs = observation[:300] + "..." if len(observation) > 300 else observation
+                        self.logger.debug("Observation: %s", display_obs)
 
                     self.history_manager.append_tool(
                         tool_name=tool_name,
@@ -618,12 +700,8 @@ class CodeAgent(Agent):
                         step,
                     )
 
-                    if self.console_verbose:
-                        display_obs = observation[:300] + "..." if len(observation) > 300 else observation
-                        self._console(f"\n👀 Observation: {display_obs}\n")
-                    elif self.logger.isEnabledFor(logging.DEBUG):
-                        display_obs = observation[:300] + "..." if len(observation) > 300 else observation
-                        self.logger.debug("Observation: %s", display_obs)
+                # 工具执行完毕，保存 checkpoint 以支持断点续传
+                self._save_checkpoint(step, pending_input)
                 continue
 
             # 无工具调用：视为最终回答
@@ -635,8 +713,10 @@ class CodeAgent(Agent):
             )
             self._log_message_write(trace_logger, "assistant", final_text, {"action_type": "final"}, step)
             trace_logger.log_event("finish", {"final": final_text}, step=step)
+            self._mark_checkpoint_completed()
             return final_text
 
+        self._mark_checkpoint_completed()
         return "抱歉，我无法在限定步数内完成这个任务。"
 
     # =========================================================================
@@ -664,8 +744,9 @@ class CodeAgent(Agent):
         return self.context_builder.get_system_messages()
 
     def _build_messages(self, history_messages: list[dict]) -> list[dict]:
-        system_messages = self._get_system_messages_for_run()
-        return list(system_messages) + list(history_messages)
+        # system_messages = self._get_system_messages_for_run()
+        # return list(system_messages) + list(history_messages)
+        return self.context_builder.build_messages(history_messages)
 
     def save_session(self, path: str) -> None:
         """保存会话快照（含 system messages）。"""
@@ -705,6 +786,115 @@ class CodeAgent(Agent):
                 self.context_builder.set_runtime_system_blocks(
                     ["[Team Runtime]\n- Team state restored from session snapshot."]
                 )
+
+    # ------------------------------------------------------------------
+    # Checkpoint (断点续传)
+    # ------------------------------------------------------------------
+
+    def _get_checkpoint_path(self) -> str:
+        """Return the default checkpoint file path."""
+        return os.path.join(self._checkpoint_dir, "checkpoint-latest.json")
+
+    def _save_checkpoint(self, step: int, pending_input: str) -> None:
+        """Save a checkpoint snapshot of the current ReAct state.
+
+        Called after each successful tool execution so that an interrupted
+        session can be resumed from this point.
+        """
+        try:
+            system_messages = self._get_system_messages_for_run()
+            history_messages = self.history_manager.serialize_messages()
+            tool_schema = self._get_openai_tools_for_current_mode()
+            teams_snapshot = self.team_manager.export_state() if self.team_manager else {}
+            snapshot = build_session_snapshot(
+                system_messages=system_messages,
+                history_messages=history_messages,
+                tool_schema=tool_schema,
+                project_root=self.project_root,
+                cwd=".",
+                code_law_text=self.context_builder._cached_code_law,
+                skills_prompt=self._skills_prompt,
+                mcp_tools_prompt=self._mcp_tools_prompt,
+                read_cache=self.tool_registry.export_read_cache(),
+                tool_output_dir="tool-output",
+                schema_version=1,
+                teams_snapshot=teams_snapshot,
+                parallel_work_index=(teams_snapshot.get("work_items", {}) if isinstance(teams_snapshot, dict) else {}),
+                team_store_dir=self.team_store_dir,
+                task_store_dir=self.task_store_dir,
+            )
+            save_checkpoint(self._get_checkpoint_path(), snapshot, pending_input, step)
+            self.logger.debug("Checkpoint saved: step=%d", step)
+        except Exception as exc:
+            self.logger.warning("Failed to save checkpoint at step %d: %s", step, exc)
+
+    def _mark_checkpoint_completed(self) -> None:
+        """Mark the current checkpoint as completed (loop finished normally)."""
+        try:
+            mark_checkpoint_completed(self._get_checkpoint_path())
+        except Exception:
+            pass
+
+    def _clear_checkpoint(self) -> None:
+        """Remove the checkpoint file."""
+        try:
+            clear_checkpoint(self._get_checkpoint_path())
+        except Exception:
+            pass
+
+    def load_checkpoint(self, path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load a checkpoint if one is resumable.
+
+        Returns the checkpoint dict (with checkpoint_pending_input,
+        checkpoint_current_step, history_messages, etc.) or None.
+        """
+        cp_path = path or self._get_checkpoint_path()
+        return load_checkpoint(cp_path)
+
+    def resume_from_checkpoint(self, checkpoint: Dict[str, Any], show_raw: bool = False) -> str:
+        """Resume a ReAct loop from a saved checkpoint.
+
+        Restores history, then continues the loop from the saved step.
+        """
+        # Restore history from checkpoint
+        history_items = checkpoint.get("history_messages") or []
+        self.history_manager.load_messages(history_items)
+        self._system_messages_override = checkpoint.get("system_messages") or []
+        self.tool_registry.import_read_cache(checkpoint.get("read_cache") or {})
+        if self.team_manager:
+            self.team_manager.import_state(checkpoint.get("teams_snapshot") or {})
+
+        pending_input = checkpoint["checkpoint_pending_input"]
+        resume_step = checkpoint["checkpoint_current_step"]
+
+        self.logger.info("Resuming from checkpoint: step=%d, pending_input=%s", resume_step, pending_input[:80])
+        if self.console_verbose:
+            self._console(f"\n🔄 从检查点恢复: step={resume_step}")
+
+        trace_logger = self.trace_logger
+        self._run_id += 1
+        run_id = self._run_id
+        self._log_system_messages_if_needed(trace_logger)
+        trace_logger.log_event(
+            "checkpoint_resume",
+            {"run_id": run_id, "resume_step": resume_step, "pending_input": pending_input},
+            step=resume_step,
+        )
+
+        try:
+            response_text = self._react_loop(
+                pending_input=pending_input,
+                show_raw=show_raw,
+                trace_logger=trace_logger,
+                resume_from_step=resume_step + 1,
+            )
+        finally:
+            trace_logger.log_event(
+                "run_end",
+                {"run_id": run_id, "final": response_text if "response_text" in locals() else "", "resumed": True},
+                step=0,
+            )
+        return response_text
 
     def _print_context_preview(
         self,
@@ -866,6 +1056,67 @@ class CodeAgent(Agent):
         res = self.tool_registry.execute_tool(tool_name, tool_input)
         return str(res)
 
+    def _execute_tool_call(self, call: dict) -> dict:
+        """Execute a single tool call and return a result dict.
+
+        This is a self-contained unit suitable for parallel execution via
+        ThreadPoolExecutor.  Returns::
+
+            {
+                "tool_name": str,
+                "tool_call_id": str,
+                "tool_input": dict | Any,
+                "observation": str,
+                "error": bool,
+            }
+        """
+        tool_name = call.get("name") or "unknown_tool"
+        tool_call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
+        raw_args = call.get("arguments") or {}
+        tool_input, parse_err = self._ensure_json_input(raw_args)
+
+        if parse_err:
+            error_result = {
+                "status": "error",
+                "error": {"code": "INVALID_PARAM", "message": f"Tool arguments parse error: {parse_err}"},
+                "data": {},
+            }
+            return {
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_input": raw_args,
+                "observation": json.dumps(error_result, ensure_ascii=False),
+                "error": True,
+                "error_stage": "tool_call_parse",
+                "error_message": str(parse_err),
+            }
+
+        try:
+            observation = self._execute_tool(tool_name, tool_input)
+            return {
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_input": tool_input,
+                "observation": observation,
+                "error": False,
+            }
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "error": {"code": "EXECUTION_ERROR", "message": str(e)},
+                "data": {},
+            }
+            return {
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "tool_input": tool_input,
+                "observation": json.dumps(error_result, ensure_ascii=False),
+                "error": True,
+                "error_stage": "tool_execution",
+                "error_message": str(e),
+                "traceback": tb.format_exc(),
+            }
+
     def set_delegate_mode(self, enabled: bool) -> None:
         self.delegate_mode = bool(enabled)
         if hasattr(self.config, "delegate_mode"):
@@ -905,16 +1156,34 @@ class CodeAgent(Agent):
     @staticmethod
     def _extract_content(raw_response: Any) -> Optional[str]:
         try:
+            choices = None
             if hasattr(raw_response, "choices"):
-                content = raw_response.choices[0].message.content
-                if isinstance(content, list):
-                    return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-                return content
-            if isinstance(raw_response, dict) and raw_response.get("choices"):
-                content = raw_response["choices"][0]["message"].get("content")
-                if isinstance(content, list):
-                    return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-                return content
+                choices = raw_response.choices
+            elif isinstance(raw_response, dict):
+                choices = raw_response.get("choices")
+            
+            if not choices or len(choices) == 0:
+                return None
+            
+            choice = choices[0]
+            message = None
+            if hasattr(choice, "message"):
+                message = choice.message
+            elif isinstance(choice, dict):
+                message = choice.get("message")
+            
+            if not message:
+                return None
+            
+            content = None
+            if hasattr(message, "content"):
+                content = message.content
+            elif isinstance(message, dict):
+                content = message.get("content")
+            
+            if isinstance(content, list):
+                return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            return content
         except Exception:
             return str(raw_response)
 
@@ -987,7 +1256,7 @@ class CodeAgent(Agent):
 
         try:
             choices = _get_attr(raw_response, "choices")
-            if not choices:
+            if not choices or len(choices) == 0:
                 return []
             choice = choices[0]
             message = _get_attr(choice, "message")

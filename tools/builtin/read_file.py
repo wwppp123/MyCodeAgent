@@ -431,19 +431,20 @@ class ReadTool(Tool):
         if modified_externally:
             data["modified_externally"] = True
         
-        # 构建 text 字段（人类可读的描述）
+        # 构建 text 字段（人类可读的描述 + 明确指引 LLM 查看 data.content）
         lines = []
-        
+
         # mtime 追踪警告（C4）：文件被外部修改时优先提示
         if modified_externally:
             lines.append(f"Note: '{rel_path}' was modified externally.")
-        
+
         if total_lines == 0:
             lines.append(f"Read 0 lines from '{rel_path}' (file is empty).")
         else:
             lines.append(f"Read {lines_read} lines from '{rel_path}' (Lines {start_line}-{end_line}).")
-        
+
         lines.append(f"(Took {time_ms}ms)")
+        lines.append(f"File content is in data.content (see below or in the full response).")
         
         # 如果截断，提示剩余行数
         if truncated:

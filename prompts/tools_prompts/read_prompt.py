@@ -35,6 +35,8 @@ Response Structure
 - data.fallback_encoding: string (optional)
   Present when encoding fallback was used (e.g., "replace").
 - text: Human-readable summary with pagination hints.
+  IMPORTANT: The actual file content is in data.content, not in text.
+  Always read data.content to get the file lines.
 - stats: {time_ms, lines_read, chars_read, total_lines, file_size_bytes, encoding}
 - context: {cwd, params_input, path_resolved}
 - error: {code, message} (only when status="error")

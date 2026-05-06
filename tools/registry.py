@@ -7,6 +7,7 @@ import json
 import time
 import logging
 import os
+import threading
 from typing import Optional, Any, Callable, TypedDict
 
 from .base import Tool, ToolStatus, ErrorCode, ToolParameter
@@ -45,6 +46,7 @@ class ToolRegistry:
         # Read 元信息缓存（用于乐观锁自动注入）
         # key: path_resolved 或原始 path
         self._read_cache: dict[str, ReadMeta] = {}
+        self._read_cache_lock = threading.Lock()
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "3")),
             recovery_timeout=int(os.getenv("CIRCUIT_RECOVERY_TIMEOUT", "300")),
@@ -296,12 +298,14 @@ class ToolRegistry:
 
     def export_read_cache(self) -> dict[str, ReadMeta]:
         """导出 Read 缓存（用于会话持久）。"""
-        return dict(self._read_cache)
+        with self._read_cache_lock:
+            return dict(self._read_cache)
 
     def import_read_cache(self, data: dict[str, ReadMeta]) -> None:
         """恢复 Read 缓存（用于会话持久）。"""
         if isinstance(data, dict):
-            self._read_cache = dict(data)
+            with self._read_cache_lock:
+                self._read_cache = dict(data)
     
     def _inject_optimistic_lock_params(self, tool_name: str, parameters: dict) -> dict:
         """
@@ -327,14 +331,15 @@ class ToolRegistry:
             return parameters
         
         # 尝试从缓存查找（先用原始 path，再用规范化 path）
-        meta = self._read_cache.get(path)
-        if not meta:
-            # 尝试规范化路径匹配
-            # 注意：这里的规范化逻辑应与工具内部一致
-            normalized_path = path.replace("\\", "/")
-            if normalized_path.startswith("./"):
-                normalized_path = normalized_path[2:]
-            meta = self._read_cache.get(normalized_path)
+        with self._read_cache_lock:
+            meta = self._read_cache.get(path)
+            if not meta:
+                # 尝试规范化路径匹配
+                # 注意：这里的规范化逻辑应与工具内部一致
+                normalized_path = path.replace("\\", "/")
+                if normalized_path.startswith("./"):
+                    normalized_path = normalized_path[2:]
+                meta = self._read_cache.get(normalized_path)
         
         if meta:
             # 找到缓存，注入参数
@@ -403,13 +408,14 @@ class ToolRegistry:
         }
         
         # 使用 path_resolved 作为主键
-        if path_resolved:
-            self._read_cache[path_resolved] = meta
-        
-        # 同时用原始 path 作为别名键（便于匹配）
-        original_path = params_input.get("path")
-        if original_path and original_path != path_resolved:
-            self._read_cache[original_path] = meta
+        with self._read_cache_lock:
+            if path_resolved:
+                self._read_cache[path_resolved] = meta
+
+            # 同时用原始 path 作为别名键（便于匹配）
+            original_path = params_input.get("path")
+            if original_path and original_path != path_resolved:
+                self._read_cache[original_path] = meta
         
         logger.debug(
             f"[OptimisticLock] Cached Read meta: path={path_resolved}, "
@@ -422,7 +428,8 @@ class ToolRegistry:
         
         在需要重置乐观锁状态时调用（如新会话开始）。
         """
-        self._read_cache.clear()
+        with self._read_cache_lock:
+            self._read_cache.clear()
         logger.debug("[OptimisticLock] Read cache cleared.")
     
     def _normalize_result(self, tool_name: str, result: Any, params_input: Any) -> dict:

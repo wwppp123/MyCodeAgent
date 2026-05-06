@@ -6,3 +6,7 @@ python-dotenv>=1.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
 pytest>=7.0.0
+
+# 可选依赖（精确 token 估算）
+# pip install tiktoken  # 推荐安装以获得精确的 token 计数
+# 如果不安装，系统会自动降级到语言感知的启发式估算

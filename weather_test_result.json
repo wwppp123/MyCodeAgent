@@ -1,0 +1,232 @@
+[
+  {
+    "city": "北京",
+    "result": {
+      "status": "success",
+      "data": {
+        "latitude": 39.9042,
+        "longitude": 116.4074,
+        "generationtime_ms": 0.059485435485839844,
+        "utc_offset_seconds": 28800,
+        "timezone": "Asia/Shanghai",
+        "timezone_abbreviation": "GMT+8",
+        "elevation": 47.0,
+        "current_weather_units": {
+          "time": "iso8601",
+          "interval": "seconds",
+          "temperature": "°C",
+          "windspeed": "km/h",
+          "winddirection": "°",
+          "is_day": "",
+          "weathercode": "wmo code"
+        },
+        "current_weather": {
+          "time": "2026-04-07T10:30",
+          "interval": 900,
+          "temperature": 10.7,
+          "windspeed": 4.3,
+          "winddirection": 95,
+          "is_day": 1,
+          "weathercode": 0
+        },
+        "city_name": "北京"
+      },
+      "text": "🌤️ 北京：晴朗，温度 10.7°C，风速 4.3 km/h",
+      "stats": {
+        "time_ms": 2429,
+        "source": "Open-Meteo"
+      },
+      "context": {
+        "cwd": ".",
+        "params_input": {
+          "city": "北京",
+          "format": "simple"
+        }
+      }
+    }
+  },
+  {
+    "city": "吉林",
+    "result": {
+      "status": "success",
+      "data": {
+        "latitude": 43.8721,
+        "longitude": 126.5667,
+        "generationtime_ms": 0.1558065414428711,
+        "utc_offset_seconds": 28800,
+        "timezone": "Asia/Shanghai",
+        "timezone_abbreviation": "GMT+8",
+        "elevation": 193.0,
+        "current_weather_units": {
+          "time": "iso8601",
+          "interval": "seconds",
+          "temperature": "°C",
+          "windspeed": "km/h",
+          "winddirection": "°",
+          "is_day": "",
+          "weathercode": "wmo code"
+        },
+        "current_weather": {
+          "time": "2026-04-07T10:30",
+          "interval": 900,
+          "temperature": 3.9,
+          "windspeed": 10.9,
+          "winddirection": 287,
+          "is_day": 1,
+          "weathercode": 3
+        },
+        "city_name": "吉林"
+      },
+      "text": "🌤️ 吉林：阴天，温度 3.9°C，风速 10.9 km/h",
+      "stats": {
+        "time_ms": 2178,
+        "source": "Open-Meteo"
+      },
+      "context": {
+        "cwd": ".",
+        "params_input": {
+          "city": "吉林",
+          "format": "simple"
+        }
+      }
+    }
+  },
+  {
+    "city": "长春",
+    "result": {
+      "status": "success",
+      "data": {
+        "latitude": 43.8868,
+        "longitude": 125.3245,
+        "generationtime_ms": 0.05602836608886719,
+        "utc_offset_seconds": 28800,
+        "timezone": "Asia/Shanghai",
+        "timezone_abbreviation": "GMT+8",
+        "elevation": 222.0,
+        "current_weather_units": {
+          "time": "iso8601",
+          "interval": "seconds",
+          "temperature": "°C",
+          "windspeed": "km/h",
+          "winddirection": "°",
+          "is_day": "",
+          "weathercode": "wmo code"
+        },
+        "current_weather": {
+          "time": "2026-04-07T10:30",
+          "interval": 900,
+          "temperature": 5.6,
+          "windspeed": 13.7,
+          "winddirection": 273,
+          "is_day": 1,
+          "weathercode": 2
+        },
+        "city_name": "长春"
+      },
+      "text": "🌤️ 长春：部分多云，温度 5.6°C，风速 13.7 km/h",
+      "stats": {
+        "time_ms": 2422,
+        "source": "Open-Meteo"
+      },
+      "context": {
+        "cwd": ".",
+        "params_input": {
+          "city": "长春",
+          "format": "simple"
+        }
+      }
+    }
+  },
+  {
+    "city": "Shanghai",
+    "result": {
+      "status": "success",
+      "data": {
+        "latitude": 31.2304,
+        "longitude": 121.4737,
+        "generationtime_ms": 0.05328655242919922,
+        "utc_offset_seconds": 28800,
+        "timezone": "Asia/Shanghai",
+        "timezone_abbreviation": "GMT+8",
+        "elevation": 5.0,
+        "current_weather_units": {
+          "time": "iso8601",
+          "interval": "seconds",
+          "temperature": "°C",
+          "windspeed": "km/h",
+          "winddirection": "°",
+          "is_day": "",
+          "weathercode": "wmo code"
+        },
+        "current_weather": {
+          "time": "2026-04-07T10:30",
+          "interval": 900,
+          "temperature": 16.9,
+          "windspeed": 14.2,
+          "winddirection": 74,
+          "is_day": 1,
+          "weathercode": 0
+        },
+        "city_name": "Shanghai"
+      },
+      "text": "🌤️ Shanghai：晴朗，温度 16.9°C，风速 14.2 km/h",
+      "stats": {
+        "time_ms": 2232,
+        "source": "Open-Meteo"
+      },
+      "context": {
+        "cwd": ".",
+        "params_input": {
+          "city": "Shanghai",
+          "format": "simple"
+        }
+      }
+    }
+  },
+  {
+    "city": "深圳",
+    "result": {
+      "status": "success",
+      "data": {
+        "latitude": 22.5431,
+        "longitude": 114.0579,
+        "generationtime_ms": 0.048279762268066406,
+        "utc_offset_seconds": 28800,
+        "timezone": "Asia/Shanghai",
+        "timezone_abbreviation": "GMT+8",
+        "elevation": 13.0,
+        "current_weather_units": {
+          "time": "iso8601",
+          "interval": "seconds",
+          "temperature": "°C",
+          "windspeed": "km/h",
+          "winddirection": "°",
+          "is_day": "",
+          "weathercode": "wmo code"
+        },
+        "current_weather": {
+          "time": "2026-04-07T10:30",
+          "interval": 900,
+          "temperature": 27.1,
+          "windspeed": 11.2,
+          "winddirection": 186,
+          "is_day": 1,
+          "weathercode": 3
+        },
+        "city_name": "深圳"
+      },
+      "text": "🌤️ 深圳：阴天，温度 27.1°C，风速 11.2 km/h",
+      "stats": {
+        "time_ms": 1969,
+        "source": "Open-Meteo"
+      },
+      "context": {
+        "cwd": ".",
+        "params_input": {
+          "city": "深圳",
+          "format": "simple"
+        }
+      }
+    }
+  }
+]

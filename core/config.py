@@ -33,6 +33,9 @@ class Config(BaseModel):
     teammate_mode: str = "auto"
     delegate_mode: bool = False
     
+    # 持久化记忆配置
+    memory_store_path: str = ".agent_memory/memory.json"
+    
     # 上下文工程配置（E5）
     context_window: int = 128000  # 默认 128K tokens
     compression_threshold: float = 0.8  # 触发压缩的阈值比例
@@ -64,6 +67,7 @@ class Config(BaseModel):
             agent_tasks_store_dir=os.getenv("AGENT_TASKS_STORE_DIR", ".tasks"),
             teammate_mode=teammate_mode_raw,
             delegate_mode=str(delegate_mode_raw).lower() in {"1", "true", "yes", "y", "on"},
+            memory_store_path=os.getenv("MEMORY_STORE_PATH", ".agent_memory/memory.json"),
             context_window=int(os.getenv("CONTEXT_WINDOW", "128000")),
             compression_threshold=float(os.getenv("COMPRESSION_THRESHOLD", "0.8")),
             min_retain_rounds=int(os.getenv("MIN_RETAIN_ROUNDS", "10")),

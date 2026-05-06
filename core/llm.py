@@ -357,8 +357,6 @@ class HelloAgentsLLM:
 
     def _requires_temperature_one(self) -> bool:
         """Kimi 2.5 / K2 系列模型仅接受 temperature=1。"""
-        if self.provider != "kimi":
-            return False
         model = (self.model or "").strip().lower()
         if not model:
             return False
@@ -372,6 +370,7 @@ class HelloAgentsLLM:
             "-k2",
             "/k2",
             "k2",
+            "moonshotai/kimi",
         )
         return any(marker in model for marker in strict_markers)
 
@@ -506,7 +505,20 @@ class HelloAgentsLLM:
                 request_kwargs = self._apply_provider_compat(request_kwargs)
                 request_kwargs = self._compact_request_kwargs(request_kwargs)
                 response = self._client.chat.completions.create(**request_kwargs)
-                return response.choices[0].message.content
+                
+                # 检查响应是否有效
+                if not response or not hasattr(response, 'choices') or not response.choices:
+                    raise Exception("LLM returned empty response")
+                
+                choice = response.choices[0]
+                if not choice or not hasattr(choice, 'message') or not choice.message:
+                    raise Exception("LLM returned empty message")
+                
+                content = choice.message.content
+                if not content:
+                    raise Exception("LLM returned empty content")
+                
+                return content
             except Exception as e:
                 if attempt >= self.max_retries:
                     raise HelloAgentsException(f"LLM调用失败: {str(e)}")
@@ -539,6 +551,16 @@ class HelloAgentsLLM:
                 request_kwargs = self._apply_provider_compat(request_kwargs)
                 request_kwargs = self._compact_request_kwargs(request_kwargs)
                 response = self._client.chat.completions.create(**request_kwargs)
+                
+                # 检查响应是否有效
+                if not response or not hasattr(response, 'choices') or not response.choices:
+                    raise Exception("LLM returned empty response")
+                
+                choice = response.choices[0]
+                if not choice or not hasattr(choice, 'message') or not choice.message:
+                    raise Exception("LLM returned empty message")
+                
+                # 即使content为空，也返回响应对象，让调用方处理
                 return response
             except Exception as e:
                 if attempt >= self.max_retries:

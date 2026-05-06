@@ -1,0 +1,35 @@
+58:     def build_messages(
+59:         self,
+60:         history_messages: List[Dict[str, Any]],
+61:     ) -> List[Dict[str, Any]]:
+62:         """
+63:         构建完整的 messages 列表
+64:         
+65:         Args:
+66:             history_messages: 来自 HistoryManager.to_messages() 的历史消息列表
+67:         
+68:         Returns:
+69:             完整的 messages 列表，可直接传给 LLM
+70:         """
+71:         messages: List[Dict[str, Any]] = []
+72:         
+73:         # L1: System prompt + Tools（缓存）
+74:         system_messages = self._get_system_messages()
+75: 
+76:         # 替换系统提示词中的时间
+77:         now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+78:         current_time_str = now.strftime("%Y-%m-%d %H:%M:%S") + "( Asia/Shanghai)"
+79:         replaced_system_messages = []
+80:         for msg in system_messages:
+81:             msg_copy = dict(msg)
+82:             msg_copy["content"] = msg_copy["content"].replace("{{CURRENT_TIME}}", current_time_str)
+83:             replaced_system_messages.append(msg_copy)
+84: 
+85:         messages.extend(replaced_system_messages)
+86:         
+87:         # L3/L4: History messages（包含 user/assistant/tool/summary）
+88:         messages.extend(history_messages)
+89:         
+90:         return messages
+91: 
+92:     def get_system_messages(self) -> List[Dict[str, Any]]:

@@ -20,4 +20,5 @@ claude_code_env.sh
 .vscode/
 techBlogs/
 memory/
+.agent_memory/
 eval/   
